@@ -463,6 +463,34 @@ impl FactoryContract {
             _ => None,
         }
     }
+
+    /// Get metadata for a specific pool.
+    pub fn get_arena(env: Env, pool_id: u32) -> Option<ArenaMetadata> {
+        let key = (METADATA_PREFIX, pool_id);
+        env.storage().instance().get(&key)
+    }
+
+    /// Get a paginated list of arena metadata.
+    pub fn get_arenas(env: Env, offset: u32, limit: u32) -> soroban_sdk::Vec<ArenaMetadata> {
+        let all_pools: soroban_sdk::Vec<u32> = env
+            .storage()
+            .instance()
+            .get(&ALL_POOLS_KEY)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+
+        let mut results = soroban_sdk::Vec::new(&env);
+        let start = offset;
+        let end = core::cmp::min(offset + limit, all_pools.len());
+
+        for i in start..end {
+            if let Some(pool_id) = all_pools.get(i) {
+                if let Some(meta) = Self::get_arena(env.clone(), pool_id) {
+                    results.push_back(meta);
+                }
+            }
+        }
+        results
+    }
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
