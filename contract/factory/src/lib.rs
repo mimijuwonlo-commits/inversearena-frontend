@@ -35,6 +35,12 @@ pub struct ArenaMetadata {
 
 const MAX_POOL_CAPACITY: u32 = 256;
 
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    SupportedToken(Address),
+}
+
 // ── Timelock constant: 48 hours in seconds ────────────────────────────────────
 
 const TIMELOCK_PERIOD: u64 = 48 * 60 * 60;
@@ -389,6 +395,44 @@ impl FactoryContract {
             .publish((TOPIC_POOL_CREATED,), (EVENT_VERSION, pool_id, caller, capacity, stake, arena_address.clone()));
 
         Ok(arena_address)
+    }
+
+    pub fn add_supported_token(env: Env, token: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .expect("not initialized");
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::SupportedToken(token), &true);
+    }
+
+    pub fn create_pool(
+        env: Env,
+        amount: i128,
+        currency: Address,
+        _round_speed: u32,
+        capacity: u32,
+    ) -> Result<Address, Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidStakeForPool);
+        }
+        if capacity < 2 || capacity > 1000 {
+            return Err(Error::InvalidInput);
+        }
+        let supported: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SupportedToken(currency))
+            .unwrap_or(false);
+        if !supported {
+            return Err(Error::UnsupportedToken);
+        }
+
+        // Dummy logic to return the factory address as the "pool" address since actual pool deployment isn't defined here.
+        Ok(env.current_contract_address())
     }
 
     // ── Upgrade mechanism ────────────────────────────────────────────────────
