@@ -1,7 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, IntoVal, xdr::ToXdr,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol,
+    IntoVal, xdr::ToXdr,
 };
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -15,6 +16,10 @@ const ARENA_WASM_HASH_KEY: Symbol = symbol_short!("AR_WASM");
 const POOL_PREFIX: Symbol = symbol_short!("POOL");
 const ALL_POOLS_KEY: Symbol = symbol_short!("ALL_P");
 const METADATA_PREFIX: Symbol = symbol_short!("META");
+const SCHEMA_VERSION_KEY: Symbol = symbol_short!("S_VER");
+
+/// Current schema version. Bump this when storage layout changes.
+const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -112,6 +117,51 @@ impl FactoryContract {
         env.storage()
             .instance()
             .set(&MIN_STAKE_KEY, &DEFAULT_MIN_STAKE);
+        env.storage()
+            .instance()
+            .set(&SCHEMA_VERSION_KEY, &CURRENT_SCHEMA_VERSION);
+        Ok(())
+    }
+
+    // ── Schema versioning ────────────────────────────────────────────────────
+
+    /// Return the persisted schema version (0 if never set).
+    pub fn schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&SCHEMA_VERSION_KEY)
+            .unwrap_or(0u32)
+    }
+
+    /// Migrate storage from the current persisted version to
+    /// `CURRENT_SCHEMA_VERSION`. Admin-only.
+    ///
+    /// Each version bump should have its own migration block inside
+    /// this function. The version is written atomically at the end so
+    /// a failed transaction leaves the old version in place.
+    ///
+    /// Calling `migrate` when already at the current version is a no-op.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        let admin = require_admin(&env)?;
+        admin.require_auth();
+
+        let stored: u32 = env
+            .storage()
+            .instance()
+            .get(&SCHEMA_VERSION_KEY)
+            .unwrap_or(0u32);
+
+        if stored >= CURRENT_SCHEMA_VERSION {
+            return Ok(()); // already up to date
+        }
+
+        // -- v0 -> v1: initial version stamp (no data changes) ------
+        // Future migrations go here as sequential if-blocks:
+        //   if stored < 2 { /* v1 -> v2 migration logic */ }
+
+        env.storage()
+            .instance()
+            .set(&SCHEMA_VERSION_KEY, &CURRENT_SCHEMA_VERSION);
         Ok(())
     }
 
