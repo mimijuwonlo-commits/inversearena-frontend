@@ -4,7 +4,7 @@ mod bounds;
 mod invariants;
 
 use soroban_sdk::{
-    Address, BytesN, Env, Symbol, contract, contracterror, contractimpl, contracttype,
+    Address, BytesN, Env, Symbol, Vec, contract, contracterror, contractimpl, contracttype,
     symbol_short, token,
 };
 
@@ -33,6 +33,9 @@ const TOPIC_UPGRADE_EXECUTED: Symbol = symbol_short!("UP_EXEC");
 const TOPIC_UPGRADE_CANCELLED: Symbol = symbol_short!("UP_CANC");
 const TOPIC_PAUSED: Symbol = symbol_short!("PAUSED");
 const TOPIC_UNPAUSED: Symbol = symbol_short!("UNPAUSED");
+const TOPIC_ROUND_STARTED: Symbol = symbol_short!("R_START");
+const TOPIC_ROUND_TIMEOUT: Symbol = symbol_short!("R_TOUT");
+const TOPIC_ROUND_RESOLVED: Symbol = symbol_short!("RSLVD");
 const TOPIC_WINNER_SET: Symbol = symbol_short!("WIN_SET");
 const TOPIC_CLAIM: Symbol = symbol_short!("CLAIM");
 
@@ -66,6 +69,7 @@ pub enum ArenaError {
     MaxSubmissionsPerRound = 20,
     PlayerEliminated = 21,
     WrongRoundNumber = 22,
+    NotEnoughPlayers = 23,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -130,6 +134,8 @@ enum DataKey {
     Config,
     Round,
     Submission(u32, Address),
+    HeadsSubmitters(u32),
+    TailsSubmitters(u32),
     Survivor(Address),
     PrizeClaimed(Address),
     Winner(Address),
@@ -228,14 +234,18 @@ impl ArenaContract {
         env.storage().instance().set(&TOKEN_KEY, &token);
     }
 
-    pub fn set_capacity(env: Env, capacity: u32) {
+    pub fn set_capacity(env: Env, capacity: u32) -> Result<(), ArenaError> {
         let admin: Address = env
             .storage()
             .instance()
             .get(&ADMIN_KEY)
-            .expect("not initialized");
+            .ok_or(ArenaError::NotInitialized)?;
         admin.require_auth();
+        if !(bounds::MIN_ARENA_PARTICIPANTS..=bounds::MAX_ARENA_PARTICIPANTS).contains(&capacity) {
+            return Err(ArenaError::InvalidAmount);
+        }
         env.storage().instance().set(&CAPACITY_KEY, &capacity);
+        Ok(())
     }
 
     pub fn set_winner(
@@ -322,6 +332,14 @@ impl ArenaContract {
         if previous_round.active {
             return Err(ArenaError::RoundAlreadyActive);
         }
+        let survivor_count: u32 = env
+            .storage()
+            .instance()
+            .get(&SURVIVOR_COUNT_KEY)
+            .unwrap_or(0u32);
+        if survivor_count < bounds::MIN_ARENA_PARTICIPANTS {
+            return Err(ArenaError::NotEnoughPlayers);
+        }
         let round_start_ledger = env.ledger().sequence();
         let round_deadline_ledger = round_start_ledger
             .checked_add(config.round_speed_in_ledgers)
@@ -337,6 +355,15 @@ impl ArenaContract {
         };
         storage(&env).set(&DataKey::Round, &next_round);
         bump(&env, &DataKey::Round);
+        env.events().publish(
+            (TOPIC_ROUND_STARTED,),
+            (
+                next_round.round_number,
+                next_round.round_start_ledger,
+                next_round.round_deadline_ledger,
+                EVENT_VERSION,
+            ),
+        );
         Ok(next_round)
     }
 
@@ -358,6 +385,9 @@ impl ArenaContract {
         if round_number != round.round_number {
             return Err(ArenaError::WrongRoundNumber);
         }
+        if !storage(&env).has(&DataKey::Survivor(player.clone())) {
+            return Err(ArenaError::PlayerEliminated);
+        }
         if env.ledger().sequence() > round.round_deadline_ledger {
             return Err(ArenaError::SubmissionWindowClosed);
         }
@@ -370,6 +400,14 @@ impl ArenaContract {
         }
         storage(&env).set(&submission_key, &choice);
         bump(&env, &submission_key);
+        let submitters_key = match choice {
+            Choice::Heads => DataKey::HeadsSubmitters(round.round_number),
+            Choice::Tails => DataKey::TailsSubmitters(round.round_number),
+        };
+        let mut submitters = get_submitters(&env, &submitters_key);
+        submitters.push_back(player.clone());
+        storage(&env).set(&submitters_key, &submitters);
+        bump(&env, &submitters_key);
         round.total_submissions += 1;
         storage(&env).set(&DataKey::Round, &round);
         bump(&env, &DataKey::Round);
@@ -392,6 +430,83 @@ impl ArenaContract {
         round.timed_out = true;
         storage(&env).set(&DataKey::Round, &round);
         bump(&env, &DataKey::Round);
+        env.events().publish(
+            (TOPIC_ROUND_TIMEOUT,),
+            (round.round_number, round.total_submissions, EVENT_VERSION),
+        );
+        Ok(round)
+    }
+
+    pub fn resolve_round(env: Env) -> Result<RoundState, ArenaError> {
+        require_not_paused(&env)?;
+        env.storage()
+            .instance()
+            .extend_ttl(GAME_TTL_THRESHOLD, GAME_TTL_EXTEND_TO);
+        let mut round = get_round(&env)?;
+        if round.finished {
+            return Err(ArenaError::GameAlreadyFinished);
+        }
+        if round.active {
+            if env.ledger().sequence() <= round.round_deadline_ledger {
+                return Err(ArenaError::RoundStillOpen);
+            }
+            round.active = false;
+            round.timed_out = true;
+        }
+
+        let heads_key = DataKey::HeadsSubmitters(round.round_number);
+        let tails_key = DataKey::TailsSubmitters(round.round_number);
+        let heads_submitters = get_submitters(&env, &heads_key);
+        let tails_submitters = get_submitters(&env, &tails_key);
+        let heads_count = heads_submitters.len();
+        let tails_count = tails_submitters.len();
+
+        let surviving_choice =
+            choose_surviving_side(&env, round.round_number, heads_count, tails_count);
+        let eliminated_players = match surviving_choice {
+            Some(Choice::Heads) => tails_submitters,
+            Some(Choice::Tails) => heads_submitters,
+            None => Vec::new(&env),
+        };
+
+        let mut eliminated_count = 0u32;
+        for player in eliminated_players.iter() {
+            let survivor_key = DataKey::Survivor(player.clone());
+            if storage(&env).has(&survivor_key) {
+                storage(&env).remove(&survivor_key);
+                eliminated_count += 1;
+            }
+        }
+
+        let survivor_count: u32 = env
+            .storage()
+            .instance()
+            .get(&SURVIVOR_COUNT_KEY)
+            .unwrap_or(0u32);
+        let updated_survivor_count = survivor_count
+            .checked_sub(eliminated_count)
+            .ok_or(ArenaError::InvalidAmount)?;
+        env.storage()
+            .instance()
+            .set(&SURVIVOR_COUNT_KEY, &updated_survivor_count);
+
+        round.finished = true;
+        storage(&env).set(&DataKey::Round, &round);
+        bump(&env, &DataKey::Round);
+
+        env.events().publish(
+            (TOPIC_ROUND_RESOLVED,),
+            (
+                round.round_number,
+                heads_count,
+                tails_count,
+                outcome_symbol(&surviving_choice),
+                eliminated_count,
+                updated_survivor_count,
+                EVENT_VERSION,
+            ),
+        );
+
         Ok(round)
     }
 
@@ -594,12 +709,48 @@ fn require_not_paused(env: &Env) -> Result<(), ArenaError> {
     Ok(())
 }
 
+fn get_submitters(env: &Env, key: &DataKey) -> Vec<Address> {
+    storage(env).get(key).unwrap_or(Vec::new(env))
+}
+
+fn choose_surviving_side(
+    env: &Env,
+    round_number: u32,
+    heads_count: u32,
+    tails_count: u32,
+) -> Option<Choice> {
+    match (heads_count, tails_count) {
+        (0, 0) => None,
+        (0, _) => Some(Choice::Tails),
+        (_, 0) => Some(Choice::Heads),
+        _ if heads_count == tails_count => {
+            if ((env.ledger().sequence() ^ round_number) & 1) == 0 {
+                Some(Choice::Heads)
+            } else {
+                Some(Choice::Tails)
+            }
+        }
+        _ if heads_count < tails_count => Some(Choice::Heads),
+        _ => Some(Choice::Tails),
+    }
+}
+
+fn outcome_symbol(outcome: &Option<Choice>) -> Symbol {
+    match outcome {
+        Some(Choice::Heads) => symbol_short!("HEADS"),
+        Some(Choice::Tails) => symbol_short!("TAILS"),
+        None => symbol_short!("NONE"),
+    }
+}
+
 fn bump(env: &Env, key: &DataKey) {
     env.storage()
         .persistent()
         .extend_ttl(key, GAME_TTL_THRESHOLD, GAME_TTL_EXTEND_TO);
 }
 
+#[cfg(test)]
+mod abi_guard;
 #[cfg(all(test, feature = "integration-tests"))]
 mod integration_tests;
 #[cfg(test)]

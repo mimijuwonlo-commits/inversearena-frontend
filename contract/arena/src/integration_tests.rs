@@ -8,6 +8,8 @@
 
 extern crate std;
 
+use std::vec;
+
 use factory::{FactoryContract, FactoryContractClient};
 use payout::{PayoutContract, PayoutContractClient};
 use soroban_sdk::{
@@ -78,6 +80,20 @@ fn deploy_arena(
     arena
 }
 
+fn join_players(
+    env: &Env,
+    arena: &ArenaContractClient<'_>,
+    token: &StellarAssetClient<'_>,
+    players: &[Address],
+    stake: i128,
+) {
+    env.mock_all_auths();
+    for player in players {
+        token.mint(player, &(stake * 10));
+        arena.join(player, &stake);
+    }
+}
+
 // ── AC: Full lifecycle runs without error ─────────────────────────────────────
 
 /// Complete game lifecycle: factory creates pool → arena runs 3 rounds with
@@ -91,9 +107,13 @@ fn lifecycle_full_game_three_rounds_eight_players() {
     let admin = Address::generate(&env);
     let (_factory, payout) = deploy_all(&env, &admin);
 
-    let xlm_address = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let xlm_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token = StellarAssetClient::new(&env, &xlm_address);
     let round_speed = 10u32;
-    let capacity = 8u32;
+    let _capacity = 8u32;
     let stake = 10_000_000i128;
 
     let arena = deploy_arena(&env, &admin, round_speed, &xlm_address);
@@ -101,6 +121,7 @@ fn lifecycle_full_game_three_rounds_eight_players() {
     // ── Step 2: Rounds ────────────────────────────────────────────────────────
     // Generate 8 players.
     let players: std::vec::Vec<Address> = (0..8).map(|_| Address::generate(&env)).collect();
+    join_players(&env, &arena, &token, &players, stake);
 
     // ── Step 3: Round 1 — all 8 players submit ────────────────────────────────
     set_seq(&env, 1_010);
@@ -125,6 +146,7 @@ fn lifecycle_full_game_three_rounds_eight_players() {
     // ── Step 6: Payout — distribute winnings using the payout contract ───────
     let winner = players[0].clone();
     let prize_amount = 80_000_000i128;
+    token.mint(&payout.address, &prize_amount);
 
     payout.set_treasury(&admin); // Dust goes to admin for this test
     payout.distribute_prize(
@@ -177,7 +199,12 @@ fn test_payout_rounding_and_dust() {
     payout.set_treasury(&treasury);
 
     let total_prize = 100i128;
-    let currency = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let currency = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token = StellarAssetClient::new(&env, &currency);
+    token.mint(&payout.address, &total_prize);
     let winners = soroban_sdk::vec![
         &env,
         Address::generate(&env),
@@ -198,8 +225,14 @@ fn test_emergency_pause_and_resume() {
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let (_factory, _) = deploy_all(&env, &admin);
-    let xlm_address = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let xlm_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token = StellarAssetClient::new(&env, &xlm_address);
     let arena = deploy_arena(&env, &admin, 10u32, &xlm_address);
+    let players = vec![Address::generate(&env), Address::generate(&env)];
+    join_players(&env, &arena, &token, &players, 100i128);
 
     // Pause
     arena.pause();
