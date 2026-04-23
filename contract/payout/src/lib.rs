@@ -34,6 +34,8 @@ pub enum DataKey {
     CurrencyToken(Symbol),
     Payout(Symbol, u32, u32, Address),
     PrizePayout(u32),
+    SplitPayout(u32, Address),
+    SplitPayoutBatch(u32),
     PayoutHistory(u64),
     ArenaPayout(u64),
 }
@@ -49,6 +51,11 @@ pub struct PayoutData {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitPayoutReceipt {
+    pub arena_id: u32,
+    pub winner: Address,
+    pub amount: i128,
+    pub currency: Address,
 pub struct PayoutReceipt {
     pub arena_id: u64,
     pub winner: Address,
@@ -341,6 +348,95 @@ impl PayoutContract {
 
     pub fn is_prize_distributed(env: Env, game_id: u32) -> bool {
         env.storage().instance().has(&DataKey::PrizePayout(game_id))
+    }
+
+    /// Splits and transfers `total_amount` across `winners`.
+    ///
+    /// Remainder dust from integer division is sent to the first winner so
+    /// no funds are left stranded in the contract.
+    pub fn distribute_split_payout(
+        env: Env,
+        arena_id: u32,
+        winners: Vec<Address>,
+        total_amount: i128,
+        currency: Address,
+    ) -> Result<(), PayoutError> {
+        let admin = Self::admin(env.clone());
+        admin.require_auth();
+
+        require_not_paused(&env)?;
+
+        if total_amount <= 0 {
+            return Err(PayoutError::InvalidAmount);
+        }
+        if winners.is_empty() {
+            return Err(PayoutError::NoWinners);
+        }
+
+        let batch_key = DataKey::SplitPayoutBatch(arena_id);
+        if env.storage().instance().has(&batch_key) {
+            return Err(PayoutError::AlreadyPaid);
+        }
+
+        let winners_count = winners.len() as i128;
+        let per_winner = total_amount / winners_count;
+        let remainder = total_amount % winners_count;
+        let first_winner = winners.get(0).ok_or(PayoutError::NoWinners)?;
+
+        // Idempotency guard first (effects before interactions)
+        env.storage().instance().set(&batch_key, &true);
+
+        let token_client = token::Client::new(&env, &currency);
+        let contract_address = env.current_contract_address();
+
+        for winner in winners.iter() {
+            let amount = if winner == first_winner {
+                per_winner
+                    .checked_add(remainder)
+                    .ok_or(PayoutError::InvalidAmount)?
+            } else {
+                per_winner
+            };
+
+            token_client.transfer(&contract_address, &winner, &amount);
+
+            let receipt = SplitPayoutReceipt {
+                arena_id,
+                winner: winner.clone(),
+                amount,
+                currency: currency.clone(),
+            };
+            let receipt_key = DataKey::SplitPayout(arena_id, winner.clone());
+            env.storage().persistent().set(&receipt_key, &receipt);
+            env.storage()
+                .persistent()
+                .extend_ttl(&receipt_key, PAYOUT_TTL_THRESHOLD, PAYOUT_TTL_EXTEND_TO);
+
+            env.events()
+                .publish((TOPIC_PAYOUT_EXECUTED,), (winner, amount, currency.clone()));
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+
+        Ok(())
+    }
+
+    pub fn is_split_payout_distributed(env: Env, arena_id: u32) -> bool {
+        env.storage()
+            .instance()
+            .has(&DataKey::SplitPayoutBatch(arena_id))
+    }
+
+    pub fn get_split_payout_receipt(
+        env: Env,
+        arena_id: u32,
+        winner: Address,
+    ) -> Option<SplitPayoutReceipt> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SplitPayout(arena_id, winner))
     }
 
     // ── Emergency pause ──────────────────────────────────────────────────────

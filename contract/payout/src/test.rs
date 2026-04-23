@@ -248,6 +248,78 @@ fn test_distribute_prize_invalid_amount_returns_error() {
     assert_eq!(result, Err(Ok(PayoutError::InvalidAmount)));
 }
 
+#[test]
+fn test_distribute_split_payout_two_winners_equal_split() {
+    let (env, _admin, client, token_id, _treasury) = setup_with_token();
+    let winner1 = Address::generate(&env);
+    let winner2 = Address::generate(&env);
+    let mut winners = Vec::new(&env);
+    winners.push_back(winner1.clone());
+    winners.push_back(winner2.clone());
+
+    client.distribute_split_payout(&77u32, &winners, &1000i128, &token_id);
+
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&winner1), 500i128);
+    assert_eq!(token.balance(&winner2), 500i128);
+    assert!(client.is_split_payout_distributed(&77u32));
+
+    let receipt1 = client
+        .get_split_payout_receipt(&77u32, &winner1)
+        .expect("receipt for winner1 must exist");
+    let receipt2 = client
+        .get_split_payout_receipt(&77u32, &winner2)
+        .expect("receipt for winner2 must exist");
+    assert_eq!(receipt1.amount, 500i128);
+    assert_eq!(receipt2.amount, 500i128);
+}
+
+#[test]
+fn test_distribute_split_payout_three_winners_remainder_to_first() {
+    let (env, _admin, client, token_id, _treasury) = setup_with_token();
+    let winner1 = Address::generate(&env);
+    let winner2 = Address::generate(&env);
+    let winner3 = Address::generate(&env);
+    let mut winners = Vec::new(&env);
+    winners.push_back(winner1.clone());
+    winners.push_back(winner2.clone());
+    winners.push_back(winner3.clone());
+
+    client.distribute_split_payout(&78u32, &winners, &1000i128, &token_id);
+
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&winner1), 334i128);
+    assert_eq!(token.balance(&winner2), 333i128);
+    assert_eq!(token.balance(&winner3), 333i128);
+}
+
+#[test]
+fn test_distribute_split_payout_no_winners_returns_error() {
+    let (env, _admin, client, token_id, _treasury) = setup_with_token();
+    let empty: Vec<Address> = Vec::new(&env);
+
+    let result = client.try_distribute_split_payout(&79u32, &empty, &1000i128, &token_id);
+    assert_eq!(result, Err(Ok(PayoutError::NoWinners)));
+}
+
+#[test]
+fn test_distribute_split_payout_single_winner_gets_full_amount() {
+    let (env, _admin, client, token_id, _treasury) = setup_with_token();
+    let winner = Address::generate(&env);
+    let mut winners = Vec::new(&env);
+    winners.push_back(winner.clone());
+
+    client.distribute_split_payout(&80u32, &winners, &750i128, &token_id);
+
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&winner), 750i128);
+
+    let receipt = client
+        .get_split_payout_receipt(&80u32, &winner)
+        .expect("single-winner receipt must exist");
+    assert_eq!(receipt.amount, 750i128);
+}
+
 // ── persistent storage TTL ────────────────────────────────────────────────────
 
 #[test]
