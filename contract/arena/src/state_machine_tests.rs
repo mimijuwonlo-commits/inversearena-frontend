@@ -18,6 +18,8 @@ fn test_initial_state_is_pending() {
     let (env, client) = setup_env();
     let admin = Address::generate(&env);
     client.initialize(&admin);
+    let deadline = env.ledger().timestamp() + 7200;
+    client.init(&5, &100, &deadline);
     client.init(&5, &100);
     assert_eq!(client.state(), ArenaState::Pending);
 }
@@ -30,7 +32,8 @@ fn test_transition_pending_to_active() {
     let token_admin = Address::generate(&env);
     let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
     client.set_token(&token_id);
-    client.init(&5, &100);
+    let deadline = env.ledger().timestamp() + 7200;
+    client.init(&5, &100, &deadline);
 
     let p1 = Address::generate(&env);
     let p2 = Address::generate(&env);
@@ -54,6 +57,8 @@ fn test_cannot_join_after_active() {
     let token_admin = Address::generate(&env);
     let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
     client.set_token(&token_id);
+    let deadline = env.ledger().timestamp() + 7200;
+    client.init(&5, &100, &deadline);
     client.init(&5, &100);
 
     let p1 = Address::generate(&env);
@@ -80,7 +85,8 @@ fn test_transition_active_to_completed() {
     let token_admin = Address::generate(&env);
     let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
     client.set_token(&token_id);
-    client.init(&5, &100);
+    let deadline = env.ledger().timestamp() + 7200;
+    client.init(&5, &100, &deadline);
 
     let p1 = Address::generate(&env);
     let p2 = Address::generate(&env);
@@ -108,7 +114,8 @@ fn test_transition_pending_to_cancelled() {
     let (env, client) = setup_env();
     let admin = Address::generate(&env);
     client.initialize(&admin);
-    client.init(&5, &100);
+    let deadline = env.ledger().timestamp() + 7200;
+    client.init(&5, &100, &deadline);
 
     client.cancel_arena();
     assert_eq!(client.state(), ArenaState::Cancelled);
@@ -123,7 +130,8 @@ fn test_cannot_start_after_completed() {
     let token_admin = Address::generate(&env);
     let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
     client.set_token(&token_id);
-    client.init(&5, &100);
+    let deadline = env.ledger().timestamp() + 7200;
+    client.init(&5, &100, &deadline);
 
     let p1 = Address::generate(&env);
     let p2 = Address::generate(&env);
