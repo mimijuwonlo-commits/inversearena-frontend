@@ -25,6 +25,8 @@ const SCHEMA_VERSION_KEY: Symbol = symbol_short!("S_VER");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const TOKEN_COUNT_KEY: Symbol = symbol_short!("TOK_CNT");
 const MAX_PLAYERS_CAP_KEY: Symbol = symbol_short!("MAX_PLR");
+const STAKING_CONTRACT_KEY: Symbol = symbol_short!("STAKING");
+const MIN_HOST_STAKE_KEY: Symbol = symbol_short!("HST_MIN");
 
 // ── Fee timelock storage keys ─────────────────────────────────────────────────
 const WIN_FEE_BPS_KEY: Symbol = symbol_short!("FEE_BPS");
@@ -214,6 +216,10 @@ pub enum Error {
     NoPendingAdminTransfer = 29,
     /// Pending admin transfer has expired (7-day window elapsed).
     AdminTransferExpired = 30,
+    /// Staking contract not set.
+    StakingContractNotSet = 31,
+    /// Host staked balance below configured minimum host stake.
+    HostStakeInsufficient = 32,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -243,12 +249,13 @@ impl FactoryContract {
             .set(&MIN_STAKE_KEY, &DEFAULT_MIN_STAKE);
         env.storage()
             .instance()
+            .set(&MIN_HOST_STAKE_KEY, &DEFAULT_MIN_STAKE);
+        env.storage()
+            .instance()
             .set(&WIN_FEE_BPS_KEY, &DEFAULT_WIN_FEE_BPS);
         // Default creation fee is 0 (disabled) with a placeholder token address.
         // Admin should call `set_creation_fee` to configure the actual token.
-        env.storage()
-            .instance()
-            .set(&CREATION_FEE_KEY, &0i128);
+        env.storage().instance().set(&CREATION_FEE_KEY, &0i128);
         env.storage()
             .instance()
             .set(&CREATION_TOKEN_KEY, &env.current_contract_address());
@@ -338,8 +345,7 @@ impl FactoryContract {
     pub fn set_arena_wasm_hash(env: Env, wasm_hash: BytesN<32>) -> Result<(), Error> {
         let admin = require_admin(&env)?;
         admin.require_auth();
-        let previous_hash: Option<BytesN<32>> =
-            env.storage().instance().get(&ARENA_WASM_HASH_KEY);
+        let previous_hash: Option<BytesN<32>> = env.storage().instance().get(&ARENA_WASM_HASH_KEY);
         env.storage()
             .instance()
             .set(&ARENA_WASM_HASH_KEY, &wasm_hash);
@@ -418,6 +424,43 @@ impl FactoryContract {
             .unwrap_or(DEFAULT_MIN_STAKE)
     }
 
+    /// Admin-only: configure staking contract used for host stake checks.
+    pub fn set_staking_contract(env: Env, staking_contract: Address) -> Result<(), Error> {
+        let admin = require_admin(&env)?;
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&STAKING_CONTRACT_KEY, &staking_contract);
+        Ok(())
+    }
+
+    pub fn get_staking_contract(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&STAKING_CONTRACT_KEY)
+            .ok_or(Error::StakingContractNotSet)
+    }
+
+    /// Admin-only: set minimum host stake required to create arena.
+    pub fn set_min_host_stake(env: Env, min_host_stake: i128) -> Result<(), Error> {
+        let admin = require_admin(&env)?;
+        admin.require_auth();
+        if min_host_stake <= 0 {
+            return Err(Error::InvalidStakeAmount);
+        }
+        env.storage()
+            .instance()
+            .set(&MIN_HOST_STAKE_KEY, &min_host_stake);
+        Ok(())
+    }
+
+    pub fn get_min_host_stake(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&MIN_HOST_STAKE_KEY)
+            .unwrap_or(DEFAULT_MIN_STAKE)
+    }
+
     // ── Player cap ────────────────────────────────────────────────────────────
 
     /// Return the protocol-wide cap on `max_players` for new arenas.
@@ -445,9 +488,7 @@ impl FactoryContract {
         if new_cap < 2 || new_cap > MAX_PLAYERS_ABSOLUTE_CAP {
             return Err(Error::InvalidPlayerCap);
         }
-        env.storage()
-            .instance()
-            .set(&MAX_PLAYERS_CAP_KEY, &new_cap);
+        env.storage().instance().set(&MAX_PLAYERS_CAP_KEY, &new_cap);
         Ok(())
     }
 
@@ -573,7 +614,11 @@ impl FactoryContract {
             return Err(Error::InvalidCreationFee);
         }
 
-        let old_fee: i128 = env.storage().instance().get(&CREATION_FEE_KEY).unwrap_or(0i128);
+        let old_fee: i128 = env
+            .storage()
+            .instance()
+            .get(&CREATION_FEE_KEY)
+            .unwrap_or(0i128);
         env.storage().instance().set(&CREATION_FEE_KEY, &amount);
         env.storage().instance().set(&CREATION_TOKEN_KEY, &token);
 
@@ -586,7 +631,11 @@ impl FactoryContract {
 
     /// Public read: get the configured (creation_fee, fee_token).
     pub fn get_creation_fee(env: Env) -> (i128, Address) {
-        let fee: i128 = env.storage().instance().get(&CREATION_FEE_KEY).unwrap_or(0i128);
+        let fee: i128 = env
+            .storage()
+            .instance()
+            .get(&CREATION_FEE_KEY)
+            .unwrap_or(0i128);
         let tok: Address = env
             .storage()
             .instance()
@@ -658,6 +707,17 @@ impl FactoryContract {
             return Err(Error::StakeBelowMinimum);
         }
 
+        // Issue #449: host must have enough stake locked in staking contract.
+        let staking_contract = Self::get_staking_contract(env.clone())?;
+        let host_stake: i128 = env.invoke_contract(
+            &staking_contract,
+            &soroban_sdk::Symbol::new(&env, "get_host_stake"),
+            soroban_sdk::vec![&env, caller.clone().into_val(&env)],
+        );
+        if host_stake < Self::get_min_host_stake(env.clone()) {
+            return Err(Error::HostStakeInsufficient);
+        }
+
         // ── Arena creation fee (fee-then-deploy) ─────────────────────────────
         let (creation_fee, fee_token) = Self::get_creation_fee(env.clone());
         if creation_fee > 0 {
@@ -708,7 +768,8 @@ impl FactoryContract {
 
         // Deploy the contract.
         #[cfg(not(test))]
-        let arena_address = env.deployer()
+        let arena_address = env
+            .deployer()
             .with_current_contract(salt)
             .deploy_v2(wasm_hash, (env.current_contract_address(),));
 
@@ -784,11 +845,24 @@ impl FactoryContract {
             (
                 EVENT_VERSION,
                 pool_id,
-                caller,
+                caller.clone(),
                 capacity,
                 stake,
                 arena_address.clone(),
             ),
+        );
+
+        // Lock host stake against this arena id in staking contract.
+        let staking_contract = Self::get_staking_contract(env.clone())?;
+        env.invoke_contract::<()>(
+            &staking_contract,
+            &soroban_sdk::Symbol::new(&env, "lock_host_stake"),
+            soroban_sdk::vec![
+                &env,
+                caller.clone().into_val(&env),
+                (pool_id as u64).into_val(&env),
+                Self::get_min_host_stake(env.clone()).into_val(&env),
+            ],
         );
 
         Ok(arena_address)
@@ -832,7 +906,9 @@ impl FactoryContract {
             status: ArenaStatus::Pending,
             host: host.clone(),
         };
-        env.storage().persistent().set(&DataKey::ArenaRef(arena_id), &arena_ref);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArenaRef(arena_id), &arena_ref);
     }
 
     /// Retrieve the ArenaRef for a given arena_id.
@@ -931,6 +1007,21 @@ impl FactoryContract {
             .persistent()
             .set(&DataKey::ArenaRef(arena_id), &arena_ref);
 
+        // Release host stake when arena reaches terminal status.
+        if status == ArenaStatus::Completed || status == ArenaStatus::Cancelled {
+            if let Ok(staking_contract) = Self::get_staking_contract(env.clone()) {
+                env.invoke_contract::<()>(
+                    &staking_contract,
+                    &soroban_sdk::Symbol::new(&env, "release_host_stake"),
+                    soroban_sdk::vec![
+                        &env,
+                        arena_ref.host.into_val(&env),
+                        arena_id.into_val(&env),
+                    ],
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -949,9 +1040,7 @@ impl FactoryContract {
 
         let key = DataKey::SupportedToken(token.clone());
         let existed = env.storage().instance().has(&key);
-        env.storage()
-            .instance()
-            .set(&key, &true);
+        env.storage().instance().set(&key, &true);
         if !existed {
             let count: u32 = env.storage().instance().get(&TOKEN_COUNT_KEY).unwrap_or(0);
             env.storage().instance().set(&TOKEN_COUNT_KEY, &(count + 1));
@@ -981,9 +1070,7 @@ impl FactoryContract {
             }
             env.storage().instance().set(&TOKEN_COUNT_KEY, &(count - 1));
         }
-        env.storage()
-            .instance()
-            .remove(&key);
+        env.storage().instance().remove(&key);
         env.events()
             .publish((TOPIC_TOKEN_REMOVED,), (EVENT_VERSION, token));
         env.events()
@@ -1210,10 +1297,7 @@ impl FactoryContract {
 
     /// Return whether the contract is currently paused.
     pub fn is_paused(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&PAUSED_KEY)
-            .unwrap_or(false)
+        env.storage().instance().get(&PAUSED_KEY).unwrap_or(false)
     }
 
     // ── Two-step admin transfer ───────────────────────────────────────────────
@@ -1302,12 +1386,7 @@ fn require_admin(env: &Env) -> Result<Address, Error> {
 
 /// Return `Error::Paused` if the contract is currently paused.
 fn require_not_paused(env: &Env) -> Result<(), Error> {
-    if env
-        .storage()
-        .instance()
-        .get(&PAUSED_KEY)
-        .unwrap_or(false)
-    {
+    if env.storage().instance().get(&PAUSED_KEY).unwrap_or(false) {
         return Err(Error::Paused);
     }
     Ok(())
